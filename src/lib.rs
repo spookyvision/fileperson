@@ -1,7 +1,13 @@
 use caseless::default_case_fold_str;
 use itertools::Itertools;
+use log::debug;
+use rayon::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
+use std::fs::File;
+use std::path::Component;
+use std::path::Components;
+use std::sync::atomic::AtomicU32;
 use std::{
     borrow::{Borrow, Cow},
     collections::{BTreeSet, HashMap, HashSet},
@@ -16,7 +22,7 @@ use std::{
 };
 use walkdir::WalkDir;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 
 pub struct Tag {
     color: Option<String>,
@@ -78,7 +84,7 @@ struct Action<'a> {
     file: &'a FileInfo,
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone)]
 pub struct FileInfo {
     path: PathBuf,
     delete: Option<bool>,
@@ -124,9 +130,8 @@ impl FileInfo {
 
 #[derive(Serialize, Deserialize)]
 pub struct State {
-    root: PathBuf,
-    #[serde(skip)]
-    files: Vec<PathBuf>,
+    root: Directory,
+    flat: Directory,
     infos: HashSet<FileInfo>,
 }
 
@@ -140,49 +145,135 @@ impl DirEntryExt for DirEntry {
     }
 }
 
-impl State {
-    pub fn new<R: AsRef<Path>>(root: R) -> Self {
-        let root = root.as_ref();
-        let (files, dirs) = Self::files(root);
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Directory {
+    this: PathBuf,
+    entries: Vec<FsNode>,
+}
 
-        Self {
-            root: root.to_path_buf(),
-            files,
-            infos: HashSet::new(),
+impl Directory {
+    /// Get a reference to the directory's entries.
+    #[must_use]
+    pub fn entries(&self) -> &[FsNode] {
+        self.entries.as_ref()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum FsNode {
+    File(PathBuf),
+    Directory(Directory),
+}
+
+impl FsNode {
+    fn entry_iter(&mut self, components: Components) {
+        for comp in components {
+            self.entry(comp);
         }
     }
+    fn entry(&self, comp: Component) -> Option<FsNode> {
+        if let Component::Normal(n) = comp {
+            match self {
+                FsNode::File(_) => todo!(),
+                FsNode::Directory(_) => todo!(),
+            }
+        }
+        None
+    }
+}
 
-    pub fn files<R: AsRef<Path>>(root: R) -> (Vec<PathBuf>, Vec<PathBuf>) {
-        let mut files = vec![];
-        let mut dirs = vec![];
-        let root = root.as_ref();
-        for entry in WalkDir::new(root).min_depth(1).sort_by(|a, b| {
+fn load_rec(
+    parent: &mut Directory,
+    flat: &mut Directory,
+    include: &HashSet<String>,
+    count: &AtomicU32,
+) {
+    let parent_as_path = &parent.this;
+    for entry in WalkDir::new(parent_as_path)
+        .min_depth(1)
+        .max_depth(1)
+        .sort_by(|a, b| {
             natord::compare_ignore_case(
                 a.file_name().to_string_lossy().borrow(),
                 b.file_name().to_string_lossy().borrow(),
             )
-        }) {
-            match entry {
-                Ok(entry) => match entry.path().strip_prefix(root) {
-                    Ok(path) => {
-                        log::info!("{:?}", path);
-                        let p = entry.path();
-                        if p.is_dir() {
-                            dirs.push(p.to_owned())
-                        } else {
-                            p.parent();
-                            files.push(p.to_owned())
+        })
+    {
+        let val = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if val % 100 == 0 {
+            log::info!("(load) {val}");
+        }
+        match entry {
+            Ok(entry) => match entry.path().strip_prefix(parent_as_path) {
+                Ok(path) => {
+                    let p = entry.path();
+                    let node = if p.is_dir() {
+                        let cs = p.components();
+                        let mut dir = Directory {
+                            this: p.into(),
+                            entries: vec![],
+                        };
+                        load_rec(&mut dir, flat, include, count);
+                        Some(FsNode::Directory(dir))
+                    } else if p.is_file() {
+                        if let Some(name) = p.file_name() {
+                            if let Some(extension) = name.to_string_lossy().split(".").last() {
+                                if !include.contains(&extension.to_lowercase()) {
+                                    // log::warn!("includeping {name:?}");
+                                    continue;
+                                }
+                            }
                         }
+                        let node = FsNode::File(p.into());
+                        flat.entries.push(node.clone());
+                        Some(node)
+                    } else {
+                        None
+                    };
+
+                    if let Some(node) = node {
+                        parent.entries.push(node);
                     }
-                    Err(e) => log::warn!("load error: {:?}", e),
-                },
-                Err(e) => {
-                    log::warn!("load error: {:?}", e)
+                    // node_root.entries.push(FsNode::from(p));
                 }
+                Err(e) => log::warn!("load error: {:?}", e),
+            },
+            Err(e) => {
+                log::warn!("load error: {:?}", e)
             }
         }
+    }
+}
+pub fn load<R: AsRef<Path>>(
+    root: R,
+    include: &HashSet<String>,
+) -> anyhow::Result<(Directory, Directory)> {
+    let root = root.as_ref();
 
-        (files, dirs)
+    let mut node_root = Directory {
+        this: root.to_owned(),
+        entries: vec![],
+    };
+
+    let mut flat = node_root.clone();
+    let count = AtomicU32::new(0);
+    load_rec(&mut node_root, &mut flat, include, &count);
+
+    Ok((node_root, flat))
+}
+
+impl State {
+    pub fn new<R: AsRef<Path>>(root: R) -> anyhow::Result<Self> {
+        let root = root.as_ref();
+
+        let mut include = HashSet::new();
+        include.insert("psd".into());
+        let (root, flat) = load(root, &include)?;
+        Ok(Self {
+            root,
+            flat,
+            infos: HashSet::new(),
+        })
     }
 
     pub fn tags_filter<P: FnMut(&&FileInfo) -> bool>(
@@ -209,6 +300,11 @@ impl State {
     }
 }
 
+impl Extend<FileInfo> for State {
+    fn extend<T: IntoIterator<Item = FileInfo>>(&mut self, iter: T) {
+        self.infos.extend(iter);
+    }
+}
 #[cfg(test)]
 mod tests {
 
@@ -229,13 +325,16 @@ mod tests {
         let chain = &mut chain.iter();
         let root = UserDirs::new().unwrap();
         let root = root.desktop_dir().unwrap();
-        let mut state = State::new(root);
+        let mut state = State::new(root)?;
 
-        for f in state.files.clone() {
-            let mut fi = FileInfo::from(&f);
-            fi.tags = chain.take(rng.gen_range(1..4)).map(|s| s.into()).collect();
-            state.add(fi);
+        for f in state.root.entries.clone() {
+            if let FsNode::File(f) = f {
+                let mut fi = FileInfo::from(f);
+                fi.tags = chain.take(rng.gen_range(1..4)).map(|s| s.into()).collect();
+                state.infos.insert(fi);
+            }
         }
+
         println!("{:?}", state.tags().join(" "));
         Ok(())
     }
