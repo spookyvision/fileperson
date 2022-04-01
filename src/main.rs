@@ -23,12 +23,9 @@ fn main() -> anyhow::Result<()> {
     let desktop = ud.desktop_dir().unwrap().to_string_lossy().to_string();
     let arg = std::env::args().nth(1);
     let root = arg.unwrap_or(desktop);
-    let mut include = HashSet::new();
-    include.extend(
-        // ["psd", "DS_Store", "doc", "pdf", "zip", "iso", "eps"]
-        ["mp3", "wav", "caf", "aif", "aiff"].map(|s| s.to_lowercase()),
-    );
-    let (_root, files) = load(root, &include)?;
+    let include = HashSet::from(["mp3", "wav", "caf", "aif", "aiff"]);
+
+    let (_root, files) = load(root, include)?;
     let count = AtomicU32::new(0);
     files.entries().par_iter().for_each(|path| {
         if let FsNode::File(path) = path {

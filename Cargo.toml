@@ -20,7 +20,7 @@ thiserror = "1"
 walkdir = "2.3.2"
 rodio = { path = "../4k/rodio" }
 rayon = "1"
-camino = "1.0"
+camino = { version="1.0", features=["serde1"] }
 
 [dev-dependencies]
 lipsum = "0.8.0"
